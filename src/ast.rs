@@ -1,5 +1,9 @@
 use tower_lsp::lsp_types::Position;
-use tree_sitter::{Node, Range, Tree, TreeCursor};
+use tree_sitter::{Node, Point, Range, Tree, TreeCursor};
+
+pub fn lsp_position(x: Point) -> Position {
+    Position::new(x.row as u32, x.column as u32)
+}
 
 /// retrieves the smallest node that is positioned around the cursor in the tree
 pub fn cursor_node(t: &Tree, cursor: Position) -> Node {

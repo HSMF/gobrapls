@@ -1,4 +1,4 @@
-use ast::cursor_node;
+use ast::{cursor_node, lsp_position};
 use clap::Parser;
 use std::{collections::HashMap, io::Read, iter::Peekable, process::Stdio, sync::Arc};
 use tempfile::NamedTempFile;
@@ -9,6 +9,7 @@ use tokio::{
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tree_sitter::{Query, QueryCursor};
 
 use log::info;
 
@@ -53,15 +54,17 @@ mod timing {
         }
     }
 }
+
 use tower_lsp::{
     jsonrpc::Result as JResult,
     lsp_types::{
         Diagnostic, DiagnosticOptions, DiagnosticServerCapabilities, DidChangeTextDocumentParams,
         DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentDiagnosticParams,
-        DocumentDiagnosticReportResult, Hover, HoverParams, HoverProviderCapability,
-        InitializeParams, InitializeResult, InitializedParams, MessageType, Position,
-        PositionEncodingKind, Range, ServerCapabilities, TextDocumentSyncCapability,
-        TextDocumentSyncKind, WorkDoneProgressOptions,
+        DocumentDiagnosticReportResult, DocumentSymbolParams, DocumentSymbolResponse, Hover,
+        HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+        InitializedParams, Location, MessageType, OneOf, Position, PositionEncodingKind, Range,
+        ServerCapabilities, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+        WorkDoneProgressOptions,
     },
     Client, LanguageServer, LspService, Server,
 };
@@ -95,6 +98,40 @@ impl DiagnosticItem {
             message: format!("{err} {more_info}"),
         })
     }
+}
+
+fn lsp_diagnostics<'a>(
+    i: impl IntoIterator<Item = &'a DiagnosticItem>,
+    tree: Option<&tree_sitter::Tree>,
+) -> Vec<Diagnostic> {
+    i.into_iter()
+        .map(|diag| {
+            let pos = Position::new(diag.line.saturating_sub(1), diag.col.saturating_sub(1));
+            let range = match tree {
+                None => Range::new(pos, Position::new(diag.line.saturating_sub(1), diag.col)),
+                Some(t) => {
+                    let node = cursor_node(t, pos);
+                    Range::new(
+                        Position::new(
+                            node.range().start_point.row as u32,
+                            node.range().start_point.column as u32,
+                        ),
+                        Position::new(
+                            node.range().end_point.row as u32,
+                            node.range().end_point.column as u32,
+                        ),
+                    )
+                }
+            };
+            info!("range is {range:?}");
+            Diagnostic {
+                source: Some(env!("CARGO_PKG_NAME").to_string()),
+                range,
+                message: diag.message.clone(),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 async fn compute_diagnostics(options: Options, contents: &str) -> Vec<DiagnosticItem> {
@@ -185,12 +222,40 @@ impl FileInfo {
 
 #[derive(Debug)]
 struct Backend {
-    client: Client,
+    client: Arc<Client>,
     files: Arc<Mutex<HashMap<String, Arc<Mutex<FileInfo>>>>>,
     options: Options,
 }
 
 impl Backend {
+    async fn compute_diagnostics(&self, uri: Url, entry: &Arc<Mutex<FileInfo>>) {
+        let mut entry_l = entry.lock().await;
+        if entry_l.analysis_handle.is_none() {
+            let contents = entry_l.contents.clone();
+            let entry = Arc::clone(entry);
+            let options = self.options;
+            // TODO: centralized worker task that automatically dedupes requests
+            // send(timestamp, contents, file-id)
+            let client = Arc::clone(&self.client);
+            let handle = tokio::spawn(async move {
+                let contents = contents;
+                let diagnostics = compute_diagnostics(options, &contents).await;
+                let mut entry_l = entry.lock().await;
+                client
+                    .publish_diagnostics(
+                        uri,
+                        lsp_diagnostics(&diagnostics, entry_l.tree.as_ref()),
+                        None,
+                    )
+                    .await;
+                entry_l.diagnostics = diagnostics;
+                entry_l.analysis_handle = None;
+            });
+            entry_l.analysis_handle = Some(handle);
+        } else {
+            entry_l.queued = true
+        }
+    }
     async fn update_file(&self, path: &str, contents: &str) {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -219,6 +284,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
                         identifier: None,
@@ -277,10 +343,7 @@ impl LanguageServer for Backend {
             return;
         };
 
-        entry
-            .lock()
-            .await
-            .compute_diagnostics(self.options, entry)
+        self.compute_diagnostics(params.text_document.uri, entry)
             .await;
     }
 
@@ -305,36 +368,7 @@ impl LanguageServer for Backend {
             ));
         };
         let entry = file.lock().await;
-        let items = entry
-            .diagnostics
-            .iter()
-            .map(|diag| {
-                let pos = Position::new(diag.line.saturating_sub(1), diag.col.saturating_sub(1));
-                let range = match &entry.tree {
-                    None => Range::new(pos, Position::new(diag.line.saturating_sub(1), diag.col)),
-                    Some(t) => {
-                        let node = cursor_node(t, pos);
-                        Range::new(
-                            Position::new(
-                                node.range().start_point.row as u32,
-                                node.range().start_point.column as u32,
-                            ),
-                            Position::new(
-                                node.range().end_point.row as u32,
-                                node.range().end_point.column as u32,
-                            ),
-                        )
-                    }
-                };
-                info!("range is {range:?}");
-                Diagnostic {
-                    source: Some(env!("CARGO_PKG_NAME").to_string()),
-                    range,
-                    message: diag.message.clone(),
-                    ..Default::default()
-                }
-            })
-            .collect();
+        let items = lsp_diagnostics(entry.diagnostics.iter(), entry.tree.as_ref());
         log::info!("{:#?}", params);
         Ok(DocumentDiagnosticReportResult::Report(
             tower_lsp::lsp_types::DocumentDiagnosticReport::Full(
@@ -387,6 +421,50 @@ impl LanguageServer for Backend {
             range: None,
         }))
     }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> JResult<Option<DocumentSymbolResponse>> {
+        let file = params.text_document.uri.path();
+        let files = self.files.lock().await;
+        let Some(entry) = files.get(file) else {
+            return Ok(None);
+        };
+        let entry_l = entry.lock().await;
+        let Some(tree) = &entry_l.tree else {
+            return Ok(None);
+        };
+        let query = Query::new(
+            &tree_sitter_gobra::language(),
+            r#"(function_declaration name: (_) @bar)"#,
+        )
+        .expect("valid query");
+        let symbols = QueryCursor::new()
+            .matches(&query, tree.root_node(), entry_l.contents.as_bytes())
+            .map(|x| {
+                let name = x.captures[0]
+                    .node
+                    .utf8_text(entry_l.contents.as_bytes())
+                    .unwrap_or_default()
+                    .to_owned();
+                let start = lsp_position(x.captures[0].node.start_position());
+                let end = lsp_position(x.captures[0].node.end_position());
+                let location =
+                    Location::new(params.text_document.uri.to_owned(), Range { start, end });
+                #[allow(deprecated)]
+                tower_lsp::lsp_types::SymbolInformation {
+                    name,
+                    kind: SymbolKind::FUNCTION,
+                    tags: None,
+                    deprecated: None,
+                    location,
+                    container_name: None,
+                }
+            })
+            .collect();
+        Ok(Some(DocumentSymbolResponse::Flat(symbols)))
+    }
 }
 
 #[derive(clap::Parser)]
@@ -431,7 +509,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (service, socket) = LspService::new(|client| Backend {
-        client,
+        client: Arc::new(client),
         files: Arc::new(Mutex::new(HashMap::new())),
         options,
     });
