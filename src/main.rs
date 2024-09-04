@@ -311,10 +311,7 @@ impl LanguageServer for Backend {
             .map(|diag| {
                 let pos = Position::new(diag.line.saturating_sub(1), diag.col.saturating_sub(1));
                 let range = match &entry.tree {
-                    None => Range::new(
-                        Position::new(diag.line.saturating_sub(1), diag.col.saturating_sub(1)),
-                        Position::new(diag.line.saturating_sub(1), diag.col),
-                    ),
+                    None => Range::new(pos, Position::new(diag.line.saturating_sub(1), diag.col)),
                     Some(t) => {
                         let node = cursor_node(t, pos);
                         Range::new(
@@ -413,6 +410,7 @@ async fn main() -> anyhow::Result<()> {
     //     .build(Root::builder().appender("logfile").build(LevelFilter::Info))?;
 
     let f = std::fs::OpenOptions::new()
+        .create(true)
         .append(true)
         .open("/tmp/gobrapls.log")?;
 
