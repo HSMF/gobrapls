@@ -206,6 +206,16 @@ enum FunctionType {
     Func,
 }
 
+impl std::fmt::Display for FunctionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            FunctionType::Pred => "pred",
+            FunctionType::Func => "func",
+        };
+        write!(f, "{s}")
+    }
+}
+
 #[derive(Debug)]
 struct Func {
     name: String,
@@ -243,26 +253,72 @@ fn uncomment(s: &str) -> &str {
     s
 }
 
-impl FileInfo {
-    async fn compute_diagnostics(&mut self, options: Options, entry: &Arc<Mutex<Self>>) {
-        if self.analysis_handle.is_none() {
-            let contents = self.contents.clone();
-            let entry = Arc::clone(entry);
-            // TODO: centralized worker task that automatically dedupes requests
-            // send(timestamp, contents, file-id)
-            let handle = tokio::spawn(async move {
-                let contents = contents;
-                let diagnostics = compute_diagnostics(options, &contents).await;
-                let mut entry_l = entry.lock().await;
-                entry_l.diagnostics = diagnostics;
-                entry_l.analysis_handle = None;
-            });
-            self.analysis_handle = Some(handle);
+fn consume_line_comment(s: &str) -> (&str, &str) {
+    let orig = s;
+    let Some(s) = s.strip_prefix("//") else {
+        return ("", s);
+    };
+    let eol = s.find('\n').unwrap_or(s.len());
+    let Some(at) = s[..eol].find('@') else {
+        return (&orig[..eol + 2], &s[eol..]);
+    };
+    (&s[at + 1..eol], &s[eol..])
+}
+
+fn consume_block_comment(s: &str) -> (&str, &str) {
+    let orig = s;
+    let Some(s) = s.strip_prefix("/*") else {
+        return ("", s);
+    };
+
+    let Some(eoc) = s.find("*/") else {
+        return (orig, "");
+    };
+    let eoc = eoc + 2;
+    let Some(first_at) = s[..eoc].find('@') else {
+        return (&orig[..eoc + 2], &s[eoc..]);
+    };
+    let Some(second_at) = s[first_at + 1..eoc].find('@') else {
+        return (&orig[..eoc + 2], &s[eoc..]);
+    };
+
+    (&s[first_at + 1..first_at + 1 + second_at], &s[eoc..])
+}
+
+fn preprocess_go(mut before: &str) -> String {
+    let mut out = String::with_capacity(before.len());
+
+    let mut len_before = before.len();
+    while !before.is_empty() {
+        let s = before;
+
+        let sl = s.find('/').unwrap_or(s.len());
+        out.push_str(&s[..sl]);
+        let s = &s[sl..];
+
+        let (a, s) = dbg!(consume_line_comment(s));
+        out.push_str(a);
+        let (b, s) = dbg!(consume_block_comment(s));
+        out.push_str(b);
+
+        let s = if a.len() + b.len() == 0 {
+            // did not make progress,
+            let i = s.len().min(1);
+            out.push_str(&s[..i]);
+            &s[i..]
         } else {
-            self.queued = true
-        }
+            s
+        };
+
+        before = s;
+        assert_ne!(before.len(), len_before);
+        len_before = before.len();
     }
 
+    out
+}
+
+impl FileInfo {
     fn get_query<T, F>(&self, query: &str, mut fun: F) -> Vec<T>
     where
         F: FnMut(&Query, QueryMatch) -> T,
@@ -362,7 +418,7 @@ impl FileInfo {
                     .map(uncomment)
                     .join("\n");
                 Func {
-                    signature: format!("{name}({params})"),
+                    signature: format!("{name}{params}"),
                     name,
                     documentation,
                     position,
@@ -415,7 +471,14 @@ impl Backend {
         let mut files = self.files.lock().await;
         let entry = files.entry(path.to_owned()).or_default();
         let mut entry_l = entry.lock().await;
-        entry_l.contents = contents.to_owned();
+
+        info!("update_file {path}");
+        entry_l.contents = if path.ends_with(".go") {
+            preprocess_go(contents)
+        } else {
+            contents.to_owned()
+        };
+        info!("okay updating {path}");
         let parsed_tree = parser.parse(&entry_l.contents, None);
         entry_l.tree = parsed_tree;
 
@@ -560,7 +623,12 @@ impl LanguageServer for Backend {
             .utf8_text(entry_l.contents.as_bytes())
             .unwrap_or_default();
         if node.kind() == "identifier" {
-            if let Some(item) = entry_l
+            if let Some(Func {
+                signature,
+                ftyp,
+                documentation,
+                ..
+            }) = entry_l
                 .predicates()
                 .into_iter()
                 .chain(entry_l.funcs())
@@ -571,14 +639,17 @@ impl LanguageServer for Backend {
                         tower_lsp::lsp_types::MarkupContent {
                             kind: tower_lsp::lsp_types::MarkupKind::Markdown,
                             value: format!(
-                                "{}\n---------\n\n**{:?}**\n{}",
-                                item.signature, item.ftyp, item.documentation
+                                "```gobra\n{ftyp} {signature}\n```\n---------\n\n\n{documentation}\n\n",
                             ),
                         },
                     ),
                     range: None,
                 }));
             }
+        }
+
+        if file.ends_with(".go") {
+            return Ok(None);
         }
 
         Ok(Some(Hover {
@@ -690,4 +761,94 @@ async fn main() -> anyhow::Result<()> {
     Server::new(stdin, stdout, socket).serve(service).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! preprocess_go_test {
+        ($name:ident, $src:expr, $expected:expr$(,)?) => {
+            #[test]
+            fn $name() {
+                let src = $src;
+                let expected = $expected;
+
+                assert_eq!(preprocess_go(src), expected);
+            }
+        };
+    }
+
+    preprocess_go_test!(
+        preprocess_go_1,
+        r#"
+        // @ ensures res > 0
+        func foo(x int) (res int) {
+            return x + 1
+        }
+        "#,
+        r#"
+         ensures res > 0
+        func foo(x int) (res int) {
+            return x + 1
+        }
+        "#
+    );
+
+    preprocess_go_test!(
+        preprocess_go_2,
+        r#"
+        /* @ ensures res > 0 @ */
+        func foo(x int) (res int) {
+            return x + 1
+        }
+        "#,
+        r#"
+         ensures res > 0 
+        func foo(x int) (res int) {
+            return x + 1
+        }
+        "#
+    );
+
+    preprocess_go_test!(
+        preprocess_go_3,
+        r#"
+        /* @ ensures res > 0  */
+        func foo(x int) (res int) {
+            return x + 1
+        }
+        "#,
+        r#"
+        /* @ ensures res > 0  */
+        func foo(x int) (res int) {
+            return x + 1
+        }
+        "#
+    );
+
+    preprocess_go_test!(
+        preprocess_go_improper_1,
+        r#"
+        /* @ ensures res > 0
+        func foo(x int) (res int) {
+            return x + 1
+        }
+        "#,
+        r#"
+        /* @ ensures res > 0
+        func foo(x int) (res int) {
+            return x + 1
+        }
+        "#
+    );
+
+    preprocess_go_test!(preprocess_go_improper_2, r#"/**//"#, r#"/**//"#,);
+
+    preprocess_go_test!(preprocess_go_unexpected_plus, "// +gobra", "// +gobra");
+    preprocess_go_test!(
+        preprocess_go_unexpected_plus_2,
+        "// +gobra\n",
+        "// +gobra\n"
+    );
 }
