@@ -1,5 +1,6 @@
 use ast::{cursor_node, lsp_position};
 use clap::Parser;
+use itertools::Itertools;
 use std::{collections::HashMap, io::Read, iter::Peekable, process::Stdio, sync::Arc};
 use tempfile::NamedTempFile;
 use tokio::{
@@ -9,7 +10,7 @@ use tokio::{
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tree_sitter::{Query, QueryCursor};
+use tree_sitter::{Node, Query, QueryCursor, QueryMatch};
 
 use log::info;
 
@@ -199,6 +200,49 @@ struct FileInfo {
     tree: Option<tree_sitter::Tree>,
 }
 
+#[derive(Debug)]
+enum FunctionType {
+    Pred,
+    Func,
+}
+
+#[derive(Debug)]
+struct Func {
+    name: String,
+    signature: String,
+    body: String,
+    documentation: String,
+    position: Position,
+    ftyp: FunctionType,
+}
+
+fn one_match<'a>(query: &Query, mat: &QueryMatch<'_, 'a>, name: &str) -> Node<'a> {
+    let index = query.capture_index_for_name(name).unwrap();
+    mat.nodes_for_capture_index(index).next().unwrap()
+}
+
+fn many_matches<'a>(
+    query: &Query,
+    mat: &QueryMatch<'_, 'a>,
+    name: &str,
+) -> impl IntoIterator<Item = Node<'a>> {
+    let index = query.capture_index_for_name(name).unwrap();
+    mat.nodes_for_capture_index(index).collect::<Vec<_>>()
+}
+
+fn uncomment(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(s) = s.strip_prefix("//") {
+        return s.trim();
+    }
+    if let Some(s) = s.strip_prefix("/*") {
+        if let Some(s) = s.strip_suffix("*/") {
+            return s.trim();
+        }
+    }
+    s
+}
+
 impl FileInfo {
     async fn compute_diagnostics(&mut self, options: Options, entry: &Arc<Mutex<Self>>) {
         if self.analysis_handle.is_none() {
@@ -217,6 +261,116 @@ impl FileInfo {
         } else {
             self.queued = true
         }
+    }
+
+    fn get_query<T, F>(&self, query: &str, mut fun: F) -> Vec<T>
+    where
+        F: FnMut(&Query, QueryMatch) -> T,
+    {
+        let Some(tree) = &self.tree else {
+            return vec![];
+        };
+        let query = Query::new(&tree_sitter_gobra::language(), query).unwrap();
+
+        QueryCursor::new()
+            .matches(&query, tree.root_node(), self.contents.as_bytes())
+            .map(|mat| fun(&query, mat))
+            .collect()
+    }
+
+    fn predicates(&self) -> Vec<Func> {
+        self.get_query(
+            r#"
+            (
+             ((comment)*) @doc
+             .
+             (ghost_member
+               (fpredicate_decl
+                 name: (_) @name
+                 parameters: (_) @params
+                 (predicate_body) @body
+               )
+             )
+            )
+            "#,
+            |query, mat| {
+                info!("{mat:#?}");
+                let contents = self.contents.as_bytes();
+                let name = one_match(query, &mat, "name");
+                let position = lsp_position(name.start_position());
+                let name = name
+                    .utf8_text(contents)
+                    .expect("found invalid utf8, sorry")
+                    .to_owned();
+                let params = one_match(query, &mat, "params")
+                    .utf8_text(contents)
+                    .expect("found invalid utf8, sorry");
+                let body = one_match(query, &mat, "body")
+                    .utf8_text(contents)
+                    .expect("found invalid utf8, sorry")
+                    .to_owned();
+
+                let documentation = many_matches(query, &mat, "doc")
+                    .into_iter()
+                    .map(|x| x.utf8_text(contents).expect("found invalid utf8, sorry"))
+                    .map(uncomment)
+                    .join("\n");
+                Func {
+                    signature: format!("{name}{params}"),
+                    name,
+                    documentation,
+                    position,
+                    body,
+                    ftyp: FunctionType::Pred,
+                }
+            },
+        )
+    }
+
+    fn funcs(&self) -> Vec<Func> {
+        self.get_query(
+            r#"
+                (
+                 ((comment)*) @doc
+                 .
+                 (function_declaration
+                  name: (_) @name
+                  parameters: (_) @params
+                  body: (_) @body
+                 )
+                )
+            "#,
+            |query, mat| {
+                let contents = self.contents.as_bytes();
+                let name = one_match(query, &mat, "name");
+                let position = lsp_position(name.start_position());
+                let name = name
+                    .utf8_text(contents)
+                    .expect("found invalid utf8, sorry")
+                    .to_owned();
+                let params = one_match(query, &mat, "params")
+                    .utf8_text(contents)
+                    .expect("found invalid utf8, sorry");
+                let body = one_match(query, &mat, "body")
+                    .utf8_text(contents)
+                    .expect("found invalid utf8, sorry")
+                    .to_owned();
+
+                let documentation = many_matches(query, &mat, "doc")
+                    .into_iter()
+                    .map(|x| x.utf8_text(contents).expect("found invalid utf8, sorry"))
+                    .map(uncomment)
+                    .join("\n");
+                Func {
+                    signature: format!("{name}({params})"),
+                    name,
+                    documentation,
+                    position,
+                    body,
+                    ftyp: FunctionType::Func,
+                }
+            },
+        )
     }
 }
 
@@ -241,13 +395,9 @@ impl Backend {
                 let contents = contents;
                 let diagnostics = compute_diagnostics(options, &contents).await;
                 let mut entry_l = entry.lock().await;
-                client
-                    .publish_diagnostics(
-                        uri,
-                        lsp_diagnostics(&diagnostics, entry_l.tree.as_ref()),
-                        None,
-                    )
-                    .await;
+                let ldiagnostics = lsp_diagnostics(&diagnostics, entry_l.tree.as_ref());
+                info!("publishing {diagnostics:#?}");
+                client.publish_diagnostics(uri, ldiagnostics, None).await;
                 entry_l.diagnostics = diagnostics;
                 entry_l.analysis_handle = None;
             });
@@ -406,16 +556,36 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let node = ast::cursor_node(tree, cursor);
+        let ident_name = node
+            .utf8_text(entry_l.contents.as_bytes())
+            .unwrap_or_default();
+        if node.kind() == "identifier" {
+            if let Some(item) = entry_l
+                .predicates()
+                .into_iter()
+                .chain(entry_l.funcs())
+                .find(|x| x.name == ident_name)
+            {
+                return Ok(Some(Hover {
+                    contents: tower_lsp::lsp_types::HoverContents::Markup(
+                        tower_lsp::lsp_types::MarkupContent {
+                            kind: tower_lsp::lsp_types::MarkupKind::Markdown,
+                            value: format!(
+                                "{}\n---------\n\n**{:?}**\n{}",
+                                item.signature, item.ftyp, item.documentation
+                            ),
+                        },
+                    ),
+                    range: None,
+                }));
+            }
+        }
 
         Ok(Some(Hover {
             contents: tower_lsp::lsp_types::HoverContents::Markup(
                 tower_lsp::lsp_types::MarkupContent {
                     kind: tower_lsp::lsp_types::MarkupKind::PlainText,
-                    value: format!(
-                        r#"{cursor:#?}
-{node:#?}
-                    "#
-                    ),
+                    value: format!("{cursor:#?}\n{node:#?}"),
                 },
             ),
             range: None,
@@ -437,7 +607,11 @@ impl LanguageServer for Backend {
         };
         let query = Query::new(
             &tree_sitter_gobra::language(),
-            r#"(function_declaration name: (_) @bar)"#,
+            r#"[
+                (function_declaration name: (_) @bar)
+                (fpredicate_decl name: (_) @bar)
+            ]
+            "#,
         )
         .expect("valid query");
         let symbols = QueryCursor::new()
