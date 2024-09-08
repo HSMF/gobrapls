@@ -1,12 +1,19 @@
 use ast::{cursor_node, lsp_position};
 use clap::Parser;
 use itertools::Itertools;
-use std::{collections::HashMap, io::Read, iter::Peekable, process::Stdio, sync::Arc};
+use sha2::{
+    digest::{generic_array::GenericArray, OutputSizeUser},
+    Digest, Sha224,
+};
+use std::{
+    collections::HashMap, io::Read, iter::Peekable, process::Stdio, sync::Arc, time::Duration,
+};
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::Mutex,
     task::JoinHandle,
+    time::{interval, Instant},
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -15,6 +22,7 @@ use tree_sitter::{Node, Query, QueryCursor, QueryMatch};
 use log::info;
 
 pub mod ast;
+mod preprocess_go;
 mod timing {
     use log::info;
     use std::time::Instant;
@@ -59,13 +67,12 @@ mod timing {
 use tower_lsp::{
     jsonrpc::Result as JResult,
     lsp_types::{
-        Diagnostic, DiagnosticOptions, DiagnosticServerCapabilities, DidChangeTextDocumentParams,
-        DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentDiagnosticParams,
-        DocumentDiagnosticReportResult, DocumentSymbolParams, DocumentSymbolResponse, Hover,
-        HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-        InitializedParams, Location, MessageType, OneOf, Position, PositionEncodingKind, Range,
-        ServerCapabilities, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-        WorkDoneProgressOptions,
+        Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+        DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
+        DocumentSymbolParams, DocumentSymbolResponse, Hover, HoverParams, HoverProviderCapability,
+        InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf,
+        Position, PositionEncodingKind, Range, ServerCapabilities, SymbolKind,
+        TextDocumentSyncCapability, TextDocumentSyncKind, Url,
     },
     Client, LanguageServer, LspService, Server,
 };
@@ -74,6 +81,7 @@ use tower_lsp::{
 struct Options {
     java: &'static str,
     gobra: &'static str,
+    gobraflags: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +179,10 @@ async fn compute_diagnostics(options: Options, contents: &str) -> Vec<Diagnostic
         .arg(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for flag in options.gobraflags.split_whitespace() {
+        cmd.arg(flag);
+    }
+
     info!("{cmd:#?}");
 
     let cmd = cmd.spawn().unwrap();
@@ -191,6 +203,27 @@ async fn compute_diagnostics(options: Options, contents: &str) -> Vec<Diagnostic
     diagnostics
 }
 
+async fn print_update(client: Arc<Client>, uri: Url) {
+    let mut interval = interval(Duration::from_secs(1));
+    let now = Instant::now();
+    let mut i = 0;
+    let progress = ["⢎⡰", "⢎⡡", "⢎⡑", "⢎⠱", "⠎⡱", "⢊⡱", "⢌⡱", "⢆⡱"];
+    loop {
+        interval.tick().await;
+        client
+            .show_message(
+                MessageType::INFO,
+                format!(
+                    "{} checking {uri} {}s",
+                    progress[i],
+                    now.elapsed().as_secs()
+                ),
+            )
+            .await;
+        i = (i + 1) % progress.len();
+    }
+}
+
 #[derive(Debug, Default)]
 struct FileInfo {
     contents: String,
@@ -198,6 +231,8 @@ struct FileInfo {
     queued: bool,
     diagnostics: Vec<DiagnosticItem>,
     tree: Option<tree_sitter::Tree>,
+    version: i32,
+    last_checked_hash: Option<GenericArray<u8, <Sha224 as OutputSizeUser>::OutputSize>>,
 }
 
 #[derive(Debug)]
@@ -216,6 +251,7 @@ impl std::fmt::Display for FunctionType {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Func {
     name: String,
@@ -251,71 +287,6 @@ fn uncomment(s: &str) -> &str {
         }
     }
     s
-}
-
-fn consume_line_comment(s: &str) -> (&str, &str) {
-    let orig = s;
-    let Some(s) = s.strip_prefix("//") else {
-        return ("", s);
-    };
-    let eol = s.find('\n').unwrap_or(s.len());
-    let Some(at) = s[..eol].find('@') else {
-        return (&orig[..eol + 2], &s[eol..]);
-    };
-    (&s[at + 1..eol], &s[eol..])
-}
-
-fn consume_block_comment(s: &str) -> (&str, &str) {
-    let orig = s;
-    let Some(s) = s.strip_prefix("/*") else {
-        return ("", s);
-    };
-
-    let Some(eoc) = s.find("*/") else {
-        return (orig, "");
-    };
-    let eoc = eoc + 2;
-    let Some(first_at) = s[..eoc].find('@') else {
-        return (&orig[..eoc + 2], &s[eoc..]);
-    };
-    let Some(second_at) = s[first_at + 1..eoc].find('@') else {
-        return (&orig[..eoc + 2], &s[eoc..]);
-    };
-
-    (&s[first_at + 1..first_at + 1 + second_at], &s[eoc..])
-}
-
-fn preprocess_go(mut before: &str) -> String {
-    let mut out = String::with_capacity(before.len());
-
-    let mut len_before = before.len();
-    while !before.is_empty() {
-        let s = before;
-
-        let sl = s.find('/').unwrap_or(s.len());
-        out.push_str(&s[..sl]);
-        let s = &s[sl..];
-
-        let (a, s) = dbg!(consume_line_comment(s));
-        out.push_str(a);
-        let (b, s) = dbg!(consume_block_comment(s));
-        out.push_str(b);
-
-        let s = if a.len() + b.len() == 0 {
-            // did not make progress,
-            let i = s.len().min(1);
-            out.push_str(&s[..i]);
-            &s[i..]
-        } else {
-            s
-        };
-
-        before = s;
-        assert_ne!(before.len(), len_before);
-        len_before = before.len();
-    }
-
-    out
 }
 
 impl FileInfo {
@@ -440,20 +411,47 @@ struct Backend {
 impl Backend {
     async fn compute_diagnostics(&self, uri: Url, entry: &Arc<Mutex<FileInfo>>) {
         let mut entry_l = entry.lock().await;
+
+        let hash = Sha224::digest(&entry_l.contents);
+
+        if Some(hash) == entry_l.last_checked_hash {
+            self.client
+                .publish_diagnostics(
+                    uri,
+                    lsp_diagnostics(&entry_l.diagnostics, entry_l.tree.as_ref()),
+                    Some(entry_l.version),
+                )
+                .await;
+            return;
+        }
+
         if entry_l.analysis_handle.is_none() {
+            entry_l.last_checked_hash = Some(hash);
             let contents = entry_l.contents.clone();
             let entry = Arc::clone(entry);
             let options = self.options;
             // TODO: centralized worker task that automatically dedupes requests
             // send(timestamp, contents, file-id)
             let client = Arc::clone(&self.client);
+            let h = tokio::spawn(print_update(client, uri.to_owned()));
+            let client = Arc::clone(&self.client);
+            client
+                .show_message(MessageType::LOG, format!("running gobra on {uri}"))
+                .await;
             let handle = tokio::spawn(async move {
                 let contents = contents;
                 let diagnostics = compute_diagnostics(options, &contents).await;
                 let mut entry_l = entry.lock().await;
                 let ldiagnostics = lsp_diagnostics(&diagnostics, entry_l.tree.as_ref());
-                info!("publishing {diagnostics:#?}");
-                client.publish_diagnostics(uri, ldiagnostics, None).await;
+                info!("publishing {diagnostics:#?} {}", entry_l.version);
+                h.abort();
+                client
+                    .show_message(MessageType::LOG, format!("done running gobra on {uri}"))
+                    .await;
+                client
+                    .publish_diagnostics(uri, ldiagnostics, Some(entry_l.version))
+                    .await;
+                entry_l.version += 1;
                 entry_l.diagnostics = diagnostics;
                 entry_l.analysis_handle = None;
             });
@@ -474,11 +472,12 @@ impl Backend {
 
         info!("update_file {path}");
         entry_l.contents = if path.ends_with(".go") {
-            preprocess_go(contents)
+            preprocess_go::preprocess_in_place(contents.to_owned())
         } else {
             contents.to_owned()
         };
         info!("okay updating {path}");
+        info!("{}", entry_l.contents);
         let parsed_tree = parser.parse(&entry_l.contents, None);
         entry_l.tree = parsed_tree;
 
@@ -498,7 +497,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
-                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                /* diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
                         identifier: None,
                         inter_file_dependencies: true,
@@ -507,7 +506,7 @@ impl LanguageServer for Backend {
                             work_done_progress: None,
                         },
                     },
-                )),
+                )), */
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 position_encoding: Some(PositionEncodingKind::UTF16),
                 ..ServerCapabilities::default()
@@ -582,7 +581,6 @@ impl LanguageServer for Backend {
         };
         let entry = file.lock().await;
         let items = lsp_diagnostics(entry.diagnostics.iter(), entry.tree.as_ref());
-        log::info!("{:#?}", params);
         Ok(DocumentDiagnosticReportResult::Report(
             tower_lsp::lsp_types::DocumentDiagnosticReport::Full(
                 tower_lsp::lsp_types::RelatedFullDocumentDiagnosticReport {
@@ -718,6 +716,8 @@ struct App {
     java: Option<String>,
     #[clap(short, long)]
     gobra: String,
+    #[clap(long)]
+    gobraflags: String,
 }
 
 #[tokio::main]
@@ -751,7 +751,10 @@ async fn main() -> anyhow::Result<()> {
     let options = Options {
         java: app.java.map(|x| &*x.leak()).unwrap_or("java"),
         gobra: app.gobra.leak(),
+        gobraflags: app.gobraflags.leak(),
     };
+
+    let _verification_worker = tokio::spawn(async {});
 
     let (service, socket) = LspService::new(|client| Backend {
         client: Arc::new(client),
@@ -761,94 +764,4 @@ async fn main() -> anyhow::Result<()> {
     Server::new(stdin, stdout, socket).serve(service).await;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    macro_rules! preprocess_go_test {
-        ($name:ident, $src:expr, $expected:expr$(,)?) => {
-            #[test]
-            fn $name() {
-                let src = $src;
-                let expected = $expected;
-
-                assert_eq!(preprocess_go(src), expected);
-            }
-        };
-    }
-
-    preprocess_go_test!(
-        preprocess_go_1,
-        r#"
-        // @ ensures res > 0
-        func foo(x int) (res int) {
-            return x + 1
-        }
-        "#,
-        r#"
-         ensures res > 0
-        func foo(x int) (res int) {
-            return x + 1
-        }
-        "#
-    );
-
-    preprocess_go_test!(
-        preprocess_go_2,
-        r#"
-        /* @ ensures res > 0 @ */
-        func foo(x int) (res int) {
-            return x + 1
-        }
-        "#,
-        r#"
-         ensures res > 0 
-        func foo(x int) (res int) {
-            return x + 1
-        }
-        "#
-    );
-
-    preprocess_go_test!(
-        preprocess_go_3,
-        r#"
-        /* @ ensures res > 0  */
-        func foo(x int) (res int) {
-            return x + 1
-        }
-        "#,
-        r#"
-        /* @ ensures res > 0  */
-        func foo(x int) (res int) {
-            return x + 1
-        }
-        "#
-    );
-
-    preprocess_go_test!(
-        preprocess_go_improper_1,
-        r#"
-        /* @ ensures res > 0
-        func foo(x int) (res int) {
-            return x + 1
-        }
-        "#,
-        r#"
-        /* @ ensures res > 0
-        func foo(x int) (res int) {
-            return x + 1
-        }
-        "#
-    );
-
-    preprocess_go_test!(preprocess_go_improper_2, r#"/**//"#, r#"/**//"#,);
-
-    preprocess_go_test!(preprocess_go_unexpected_plus, "// +gobra", "// +gobra");
-    preprocess_go_test!(
-        preprocess_go_unexpected_plus_2,
-        "// +gobra\n",
-        "// +gobra\n"
-    );
 }
