@@ -105,9 +105,10 @@ impl Lint for SyntaxError {
     }
 
     fn lint(&self, problem: &str, _: &Query, _: QueryMatch) -> Option<Self::Diagnostic> {
-        Some(SyntaxErrorLint {
-            node: problem.to_owned(),
-        })
+        None
+        // Some(SyntaxErrorLint {
+        //     node: problem.to_owned(),
+        // })
     }
 
     fn level(&self) -> DiagnosticSeverity {
