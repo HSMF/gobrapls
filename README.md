@@ -11,6 +11,9 @@ Requires a more or less recent version of Rust
 
 ### Neovim
 
+Place the following in `~/.config/nvim/after/ftplugin/go.lua` and `~/.config/nvim/after/ftplugin/gobra.lua`
+
+- TODO filetype detection for gobra
 
 ```lua
 vim.lsp.start({
@@ -48,3 +51,13 @@ TODO check out vscode
 - TODO: no unfolding in contracts
 
 - TODO: 
+
+
+## Completion
+
+- TODO
+
+## Document Symbol
+
+- resolves functions and predicates of file
+- TODO: symbols of other files
