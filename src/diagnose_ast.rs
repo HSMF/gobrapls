@@ -11,6 +11,9 @@ trait Lint {
     type Diagnostic: Display;
     fn query(&self) -> &str;
     fn lint(&self, problem: &str, query: &Query, mtch: QueryMatch) -> Option<Self::Diagnostic>;
+    fn level(&self) -> DiagnosticSeverity {
+        DiagnosticSeverity::WARNING
+    }
 }
 
 struct SliceIndexTrigger;
@@ -89,6 +92,35 @@ impl Lint for ContractOrder {
     }
 }
 
+struct SyntaxError;
+struct SyntaxErrorLint {
+    node: String,
+}
+
+impl Lint for SyntaxError {
+    type Diagnostic = SyntaxErrorLint;
+
+    fn query(&self) -> &str {
+        include_str!("./queries/syntax_error.scm")
+    }
+
+    fn lint(&self, problem: &str, _: &Query, _: QueryMatch) -> Option<Self::Diagnostic> {
+        Some(SyntaxErrorLint {
+            node: problem.to_owned(),
+        })
+    }
+
+    fn level(&self) -> DiagnosticSeverity {
+        DiagnosticSeverity::ERROR
+    }
+}
+
+impl Display for SyntaxErrorLint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not parse {}", self.node)
+    }
+}
+
 fn diagnose_lint<L>(lint: L, tree: Node, src: &[u8]) -> Vec<Diagnostic>
 where
     L: Lint,
@@ -107,11 +139,11 @@ where
                 lsp_position(problem.end_position()),
             );
             let hint = problem.utf8_text(src).expect("invalid utf in source");
-            let lint = lint.lint(hint, &query, mtch)?;
+            let lint_item = lint.lint(hint, &query, mtch)?;
             Some(Diagnostic {
                 range,
-                message: lint.to_string(),
-                severity: Some(DiagnosticSeverity::WARNING),
+                message: lint_item.to_string(),
+                severity: Some(lint.level()),
                 ..Default::default()
             })
         })
@@ -123,6 +155,7 @@ pub fn diagnose(tree: &Tree, src: &str) -> Vec<Diagnostic> {
 
     let mut problems = vec![];
 
+    problems.extend_from_slice(&diagnose_lint(SyntaxError, tree.root_node(), src));
     problems.extend_from_slice(&diagnose_lint(SliceIndexTrigger, tree.root_node(), src));
     problems.extend_from_slice(&diagnose_lint(ContractOrder, tree.root_node(), src));
 
