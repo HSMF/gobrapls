@@ -27,7 +27,7 @@ fn is_inside(pos: Position, range: Range) -> bool {
     true
 }
 
-#[tracing::instrument(skip(cur))]
+// #[tracing::instrument(skip(cur))]
 fn smallest_node_around_cursor_node<'a>(
     n: Node<'a>,
     cursor: Position,

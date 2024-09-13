@@ -6,7 +6,12 @@ use sha2::{
     Digest, Sha224,
 };
 use std::{
-    collections::HashMap, io::Read, iter::Peekable, process::Stdio, sync::Arc, time::Duration,
+    collections::HashMap,
+    io::Read,
+    iter::Peekable,
+    process::Stdio,
+    sync::{Arc, RwLock},
+    time::Duration,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -22,6 +27,7 @@ use tree_sitter::{Node, Query, QueryCursor, QueryMatch};
 use log::info;
 
 pub mod ast;
+mod diagnose_ast;
 mod preprocess_go;
 mod timing {
     use log::info;
@@ -67,12 +73,13 @@ mod timing {
 use tower_lsp::{
     jsonrpc::Result as JResult,
     lsp_types::{
-        Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-        DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
-        DocumentSymbolParams, DocumentSymbolResponse, Hover, HoverParams, HoverProviderCapability,
-        InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf,
-        Position, PositionEncodingKind, Range, ServerCapabilities, SymbolKind,
-        TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+        Diagnostic, DiagnosticOptions, DiagnosticServerCapabilities, DidChangeTextDocumentParams,
+        DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentDiagnosticParams,
+        DocumentDiagnosticReportResult, DocumentSymbolParams, DocumentSymbolResponse, Hover,
+        HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+        InitializedParams, Location, MessageType, OneOf, Position, PositionEncodingKind, Range,
+        ServerCapabilities, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+        WorkDoneProgressOptions,
     },
     Client, LanguageServer, LspService, Server,
 };
@@ -143,7 +150,11 @@ fn lsp_diagnostics<'a>(
         .collect()
 }
 
-async fn compute_diagnostics(options: Options, contents: &str) -> Vec<DiagnosticItem> {
+async fn compute_diagnostics(
+    options: Options,
+    root: Option<String>,
+    contents: &str,
+) -> Vec<DiagnosticItem> {
     let mut f = NamedTempFile::new().expect("could create temp file");
     let path = f.path().to_owned();
     {
@@ -179,6 +190,11 @@ async fn compute_diagnostics(options: Options, contents: &str) -> Vec<Diagnostic
         .arg(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(root) = root {
+        cmd.arg("-I");
+        cmd.arg(root);
+    }
+
     for flag in options.gobraflags.split_whitespace() {
         cmd.arg(flag);
     }
@@ -406,6 +422,7 @@ struct Backend {
     client: Arc<Client>,
     files: Arc<Mutex<HashMap<String, Arc<Mutex<FileInfo>>>>>,
     options: Options,
+    root: RwLock<Option<String>>,
 }
 
 impl Backend {
@@ -429,6 +446,10 @@ impl Backend {
             entry_l.last_checked_hash = Some(hash);
             let contents = entry_l.contents.clone();
             let entry = Arc::clone(entry);
+            let root = {
+                let root = self.root.read().unwrap();
+                root.clone()
+            };
             let options = self.options;
             // TODO: centralized worker task that automatically dedupes requests
             // send(timestamp, contents, file-id)
@@ -440,7 +461,7 @@ impl Backend {
                 .await;
             let handle = tokio::spawn(async move {
                 let contents = contents;
-                let diagnostics = compute_diagnostics(options, &contents).await;
+                let diagnostics = compute_diagnostics(options, root, &contents).await;
                 let mut entry_l = entry.lock().await;
                 let ldiagnostics = lsp_diagnostics(&diagnostics, entry_l.tree.as_ref());
                 info!("publishing {diagnostics:#?} {}", entry_l.version);
@@ -490,14 +511,20 @@ impl Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     #[tracing::instrument(skip(self))]
-    async fn initialize(&self, _: InitializeParams) -> JResult<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> JResult<InitializeResult> {
+        info!("{params:#?}");
+        let root = params.root_uri.map(|x| x.path().to_owned());
+        {
+            let mut r = self.root.write().unwrap();
+            *r = root;
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
-                /* diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
                         identifier: None,
                         inter_file_dependencies: true,
@@ -506,7 +533,7 @@ impl LanguageServer for Backend {
                             work_done_progress: None,
                         },
                     },
-                )), */
+                )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 position_encoding: Some(PositionEncodingKind::UTF16),
                 ..ServerCapabilities::default()
@@ -580,7 +607,13 @@ impl LanguageServer for Backend {
             ));
         };
         let entry = file.lock().await;
-        let items = lsp_diagnostics(entry.diagnostics.iter(), entry.tree.as_ref());
+        // let mut items = lsp_diagnostics(entry.diagnostics.iter(), entry.tree.as_ref());
+        let mut items = vec![];
+
+        if let Some(tree) = &entry.tree {
+            items.extend_from_slice(&diagnose_ast::diagnose(tree, &entry.contents));
+        }
+
         Ok(DocumentDiagnosticReportResult::Report(
             tower_lsp::lsp_types::DocumentDiagnosticReport::Full(
                 tower_lsp::lsp_types::RelatedFullDocumentDiagnosticReport {
@@ -717,7 +750,7 @@ struct App {
     #[clap(short, long)]
     gobra: String,
     #[clap(long)]
-    gobraflags: String,
+    gobraflags: Option<String>,
 }
 
 #[tokio::main]
@@ -751,7 +784,7 @@ async fn main() -> anyhow::Result<()> {
     let options = Options {
         java: app.java.map(|x| &*x.leak()).unwrap_or("java"),
         gobra: app.gobra.leak(),
-        gobraflags: app.gobraflags.leak(),
+        gobraflags: app.gobraflags.map(|x| &*x.leak()).unwrap_or(""),
     };
 
     let _verification_worker = tokio::spawn(async {});
@@ -760,6 +793,7 @@ async fn main() -> anyhow::Result<()> {
         client: Arc::new(client),
         files: Arc::new(Mutex::new(HashMap::new())),
         options,
+        root: RwLock::new(None),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 
