@@ -1,7 +1,6 @@
 use std::fmt::Display;
 
 use itertools::Itertools;
-use log::{error, info};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use tree_sitter::{Node, Query, QueryCursor, QueryMatch, Tree};
 

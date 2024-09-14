@@ -119,27 +119,19 @@ impl DiagnosticItem {
 fn lsp_diagnostics<'a>(
     i: impl IntoIterator<Item = &'a DiagnosticItem>,
     tree: Option<&tree_sitter::Tree>,
+    contents: &str,
 ) -> Vec<Diagnostic> {
     i.into_iter()
         .map(|diag| {
             let pos = Position::new(diag.line.saturating_sub(1), diag.col.saturating_sub(1));
-            let range = match tree {
-                None => Range::new(pos, Position::new(diag.line.saturating_sub(1), diag.col)),
-                Some(t) => {
-                    let node = cursor_node(t, pos);
-                    Range::new(
-                        Position::new(
-                            node.range().start_point.row as u32,
-                            node.range().start_point.column as u32,
-                        ),
-                        Position::new(
-                            node.range().end_point.row as u32,
-                            node.range().end_point.column as u32,
-                        ),
-                    )
-                }
-            };
-            info!("range is {range:?}");
+            let end_col: u32 = contents
+                .lines()
+                .nth(pos.line as usize)
+                .map(|x| x.len())
+                .and_then(|x| x.try_into().ok())
+                .unwrap_or(pos.character + 1);
+            let range = Range::new(pos, Position::new(pos.line, end_col));
+            info!("range is {range:?} {diag:?}");
             Diagnostic {
                 source: Some(env!("CARGO_PKG_NAME").to_string()),
                 range,
@@ -435,7 +427,11 @@ impl Backend {
             self.client
                 .publish_diagnostics(
                     uri,
-                    lsp_diagnostics(&entry_l.diagnostics, entry_l.tree.as_ref()),
+                    lsp_diagnostics(
+                        &entry_l.diagnostics,
+                        entry_l.tree.as_ref(),
+                        &entry_l.contents,
+                    ),
                     Some(entry_l.version),
                 )
                 .await;
@@ -463,7 +459,8 @@ impl Backend {
                 let contents = contents;
                 let diagnostics = compute_diagnostics(options, root, &contents).await;
                 let mut entry_l = entry.lock().await;
-                let ldiagnostics = lsp_diagnostics(&diagnostics, entry_l.tree.as_ref());
+                let ldiagnostics =
+                    lsp_diagnostics(&diagnostics, entry_l.tree.as_ref(), &entry_l.contents);
                 info!("publishing {diagnostics:#?} {}", entry_l.version);
                 h.abort();
                 client
