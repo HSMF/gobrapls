@@ -1,3 +1,5 @@
 (trigger
-  (index_expression) @problem
+    (index_expression
+      operand: (identifier)
+    ) @problem
 )

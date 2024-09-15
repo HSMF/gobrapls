@@ -1,5 +1,6 @@
-use ast::{cursor_node, lsp_position};
+use ast::lsp_position;
 use clap::Parser;
+use diagnostic::DiagnosticItem;
 use itertools::Itertools;
 use sha2::{
     digest::{generic_array::GenericArray, OutputSizeUser},
@@ -8,7 +9,6 @@ use sha2::{
 use std::{
     collections::HashMap,
     io::Read,
-    iter::Peekable,
     process::Stdio,
     sync::{Arc, RwLock},
     time::Duration,
@@ -28,6 +28,7 @@ use log::info;
 
 pub mod ast;
 mod diagnose_ast;
+mod diagnostic;
 mod preprocess_go;
 mod timing {
     use log::info;
@@ -91,34 +92,9 @@ struct Options {
     gobraflags: &'static str,
 }
 
-#[derive(Clone, Debug)]
-struct DiagnosticItem {
-    line: u32,
-    col: u32,
-    message: String,
-}
-
-impl DiagnosticItem {
-    fn from_line<'a>(s: &str, lines: &mut Peekable<impl Iterator<Item = &'a str>>) -> Option<Self> {
-        let (_, s) = s.split_once("Error at: <")?;
-        let (_, s) = s.split_once(':')?;
-        let (line, s) = s.split_once(':')?;
-        let (col, err) = s.split_once('>')?;
-        let more_info = lines.peek()?;
-        let line = line.parse().ok()?;
-        let col = col.parse().ok()?;
-
-        Some(DiagnosticItem {
-            line,
-            col,
-            message: format!("{err} {more_info}"),
-        })
-    }
-}
-
 fn lsp_diagnostics<'a>(
     i: impl IntoIterator<Item = &'a DiagnosticItem>,
-    tree: Option<&tree_sitter::Tree>,
+    _tree: Option<&tree_sitter::Tree>,
     contents: &str,
 ) -> Vec<Diagnostic> {
     i.into_iter()
@@ -197,15 +173,7 @@ async fn compute_diagnostics(
     let o = cmd.wait_with_output().await.unwrap();
     let stdout = std::str::from_utf8(&o.stdout).unwrap();
 
-    let lines = &mut (stdout.lines()).peekable();
-    let mut diagnostics = vec![];
-    while let Some(line) = lines.next() {
-        let Some(diag) = DiagnosticItem::from_line(line, lines) else {
-            continue;
-        };
-
-        diagnostics.push(diag);
-    }
+    let diagnostics = diagnostic::from_lines(stdout.lines());
     info!("{:#?}", diagnostics);
     drop(f);
     diagnostics
