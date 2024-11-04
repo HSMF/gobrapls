@@ -709,6 +709,7 @@ impl LanguageServer for Backend {
 }
 
 #[derive(clap::Parser)]
+#[clap(version, author)]
 struct App {
     #[clap(short, long)]
     java: Option<String>,
@@ -716,6 +717,10 @@ struct App {
     gobra: String,
     #[clap(long)]
     gobraflags: Option<String>,
+
+    /// record statistics. Must give path to data directory
+    #[clap(long)]
+    stats: Option<String>,
 }
 
 #[tokio::main]
