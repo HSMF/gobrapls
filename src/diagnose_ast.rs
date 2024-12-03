@@ -121,6 +121,29 @@ impl Display for SyntaxErrorLint {
     }
 }
 
+struct AssumedTerminationLint;
+impl Display for AssumedTerminationLint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "decreases _ assumes termination, use just 'decreases' instead"
+        )
+    }
+}
+struct AssumedTermination;
+
+impl Lint for AssumedTermination {
+    type Diagnostic = AssumedTerminationLint;
+
+    fn query(&self) -> &str {
+        include_str!("./queries/assumed_termination.scm")
+    }
+
+    fn lint(&self, problem: &str, query: &Query, mtch: QueryMatch) -> Option<Self::Diagnostic> {
+        Some(AssumedTerminationLint {})
+    }
+}
+
 fn diagnose_lint<L>(lint: L, tree: Node, src: &[u8]) -> Vec<Diagnostic>
 where
     L: Lint,
@@ -158,6 +181,7 @@ pub fn diagnose(tree: &Tree, src: &str) -> Vec<Diagnostic> {
     problems.extend_from_slice(&diagnose_lint(SyntaxError, tree.root_node(), src));
     problems.extend_from_slice(&diagnose_lint(SliceIndexTrigger, tree.root_node(), src));
     problems.extend_from_slice(&diagnose_lint(ContractOrder, tree.root_node(), src));
+    problems.extend_from_slice(&diagnose_lint(AssumedTermination, tree.root_node(), src));
 
     problems
 }
