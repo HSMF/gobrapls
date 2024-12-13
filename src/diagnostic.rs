@@ -21,6 +21,7 @@ pub struct DiagnosticItem {
     pub(crate) line: u32,
     pub(crate) col: u32,
     pub(crate) message: String,
+    pub(crate) file: Option<String>,
     pub(crate) typ: Type,
 }
 
@@ -138,16 +139,17 @@ impl DiagnosticItem {
         more_info
     }
 
-    pub fn verfication_failure<'a>(
+    pub fn verification_failure<'a>(
         s: &str,
         lines: &mut Peekable<impl Iterator<Item = &'a str>>,
     ) -> Option<Self> {
-        let (err, (_, line, col)) = verification_failure(s).ok()?;
+        let (err, (file, line, col)) = verification_failure(s).ok()?;
         let more_info = Self::more_info(lines);
 
         Some(DiagnosticItem {
             line,
             col,
+            file: Some(file.to_owned()),
             message: format!("{err} {more_info}"),
             typ: Type::VerificationFailure,
         })
@@ -163,6 +165,7 @@ impl DiagnosticItem {
         Some(DiagnosticItem {
             line: 1,
             col: 1,
+            file: None,
             message: format!(
                 "encountered exception {exception} in gobra. report this. {err}\n{more_info}"
             ),
@@ -184,6 +187,7 @@ impl DiagnosticItem {
         Some(DiagnosticItem {
             line: 1,
             col: 1,
+            file: None,
             message: err.to_string(),
             typ: Type::Other,
         })
@@ -194,7 +198,7 @@ pub fn from_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Diagnosti
     let lines = &mut (lines.into_iter()).peekable();
     let mut diagnostics = vec![];
     while let Some(line) = lines.next() {
-        let Some(diag) = DiagnosticItem::verfication_failure(line, lines)
+        let Some(diag) = DiagnosticItem::verification_failure(line, lines)
             .or_else(|| DiagnosticItem::exception(line, lines))
             .or_else(|| DiagnosticItem::other(line, lines))
         else {
@@ -231,24 +235,28 @@ viper.gobra.util.Violation$LogicException: Logic error: Unexpected constant perm
             DiagnosticItem {
                 line: 1,
                 col: 1,
+                file: None,
                 message: "$ - An assumption was violated during execution.".into(),
                 typ: Other,
             },
             DiagnosticItem {
                 line: 1,
                 col: 1,
+                file: None,
                 message: "$ - Logic error: Unexpected constant perm expression: 1.".into(),
                 typ: Other,
             },
             DiagnosticItem {
                 line: 1,
                 col: 1,
+                file: None,
                 message: "encountered exception viper.gobra.util.Violation$LogicException in gobra. report this. Logic error: Unexpected constant perm expression: 1.\n        at viper.gobra.util.Violation$.violation(Violation.scala:27)\n        at viper.gobra.frontend.info.implementation.property.ConstantEvaluation.$anonfun$permConstantEval$1(ConstantEvaluation.scala:179)\n        at org.bitbucket.inkytonik.kiama.attribution.AttributionCore$CachedAttribute.liftedTree1$1(AttributionCore.scala:58)\n        at org.bitbucket.inkytonik.kiama.attribution.AttributionCore$CachedAttribute.apply(AttributionCore.scala:56)".into(),
                 typ: Exception,
             },
             DiagnosticItem {
                 line: 1,
                 col: 1,
+                file: None,
                 message: " - Could not write to the file .gobra/stats.json. Check whether the permissions to the file allow writing to it.".into(),
                 typ: Other,
             },
@@ -280,18 +288,21 @@ Assertion res > 0 might not hold.
             DiagnosticItem {
                 line: 21,
                 col: 9,
+                file: Some("foo.go".into()),
                 message: "Postcondition might not hold. Assertion res > 0 might not hold.\nAssertion res > 0 might not hold.".into(),
                 typ: Type::VerificationFailure
             },
             DiagnosticItem {
                 line: 21,
                 col: 9,
+                file: Some("foo.go".into()),
                 message: "Postcondition might not hold. Assertion res > 0 might not hold.\nAssertion res > 0 might not hold.".into(),
                 typ: Type::VerificationFailure
             },
             DiagnosticItem {
                 line: 1,
                 col: 1,
+                file: None,
                 message: " - Could not write to the file .gobra/stats.json. Check whether the permissions to the file allow writing to it.".into(),
                 typ: Type::Other,
             },

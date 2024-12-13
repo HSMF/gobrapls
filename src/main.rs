@@ -9,9 +9,11 @@ use sha2::{
 use std::{
     collections::HashMap,
     io::Read,
+    path::Path,
     process::Stdio,
     sync::{Arc, RwLock},
     time::Duration,
+    vec,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -122,6 +124,7 @@ async fn compute_diagnostics(
     options: Options,
     root: Option<String>,
     contents: &str,
+    src_path: &Path,
 ) -> Vec<DiagnosticItem> {
     let mut f = NamedTempFile::new().expect("could create temp file");
     let path = f.path().to_owned();
@@ -141,6 +144,24 @@ async fn compute_diagnostics(
 
     info!("started");
 
+    let Ok(dir) = std::fs::read_dir(src_path.parent().expect("file is not root")) else {
+        return vec![];
+    };
+    let own_name = src_path.file_name();
+    let paths = dir
+        .filter_map(|x| x.ok().map(|x| x.path()))
+        .filter(|x| {
+            x.extension()
+                .is_some_and(|x| matches!(x.to_str(), Some("go" | "gobra")))
+        })
+        .filter_map(|x| {
+            let contents = std::fs::read_to_string(&x).ok()?;
+
+            contents.contains("+gobra").then_some(x)
+        })
+        .filter(|x| x.file_name() != own_name)
+        .collect_vec();
+
     let mut cmd = tokio::process::Command::new(options.java);
     cmd.args(["-Xss1g", "-Xmx4g", "-jar", options.gobra])
         .args(["--backend", "SILICON"])
@@ -158,6 +179,9 @@ async fn compute_diagnostics(
         .arg(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for path in paths {
+        cmd.arg("-i").arg(path);
+    }
     if let Some(root) = root {
         cmd.arg("-I");
         cmd.arg(root);
@@ -172,8 +196,19 @@ async fn compute_diagnostics(
     let cmd = cmd.spawn().unwrap();
     let o = cmd.wait_with_output().await.unwrap();
     let stdout = std::str::from_utf8(&o.stdout).unwrap();
+    info!("{}", std::str::from_utf8(&o.stderr).unwrap());
 
-    let diagnostics = diagnostic::from_lines(stdout.lines());
+    let diagnostics = diagnostic::from_lines(stdout.lines())
+        .into_iter()
+        .filter(|x| {
+            x.file.is_none()
+                || x.file
+                    .as_ref()
+                    .is_some_and(|file| Path::new(&file) == f.path())
+        })
+        .take(200)
+        .collect_vec();
+
     info!("{:#?}", diagnostics);
     drop(f);
     diagnostics
@@ -425,7 +460,8 @@ impl Backend {
                 .await;
             let handle = tokio::spawn(async move {
                 let contents = contents;
-                let diagnostics = compute_diagnostics(options, root, &contents).await;
+                let diagnostics =
+                    compute_diagnostics(options, root, &contents, Path::new(uri.path())).await;
                 let mut entry_l = entry.lock().await;
                 let ldiagnostics =
                     lsp_diagnostics(&diagnostics, entry_l.tree.as_ref(), &entry_l.contents);
